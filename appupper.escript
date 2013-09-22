@@ -279,7 +279,35 @@ process_appup_directive({N, Va, Va, App, {needs_version_bump, UpInstructions}}) 
 process_appup_directive({N, Va, Vb, _App, {appup, Path, Contents}}) ->
     io:format("~s.appup generated for ~s --> ~s~n",[N, Va, Vb]),
     io:format("~p~n", [Contents]),
-    io:format("Write: ~s~n", [Path]).
+    case filelib:is_file(Path) of
+        true ->
+            {ok, Terms} = file:consult(Path),
+            case lists:member(Contents, Terms) of
+                true ->
+                    io:format("Identical directive already in file.~n");
+                false ->
+                    NewContents = prep_appfile_contents([ 
+                            Contents | remove_appup(Terms, Va, Vb) ]),
+                    ok = file:write_file(Path, NewContents),
+                    io:format("Wrote: ~s~n", [Path])
+            end;
+        false ->
+            ok = file:write_file(Path, prep_appfile_contents([Contents]))
+    end.
+
+prep_appfile_contents(Terms) ->
+    [
+        io_lib:format("~p.~n",[C]) 
+        || C <- Terms
+    ].
+
+remove_appup(Terms, Va, Vb) ->
+    lists:filter(fun ({A, [{B,_}], [{B,_}]}) -> 
+                        not (A =:= Va andalso B =:= Vb);
+                     (_) -> 
+                        true 
+                 end,
+                 Terms).
 
 %% increments app version in-place, in app file
 bump_app_version(Path) ->
