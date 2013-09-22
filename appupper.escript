@@ -11,12 +11,14 @@
 %% 3) Profit.
 
 main([]) ->
-    Apps = parse_local_appvers(["apps"]),
-    print_apps_summary(Apps),
-    ok;
+    %% Detect version of most recent release to be built:
+    {ok, [[{release, _RelName, RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
+    io:format("Comparing local with ~s~n",[RelVer]),
+    main([RelVer]);
 
 %% working copy vs last _rel version
-main([RelName, RelVsn]) ->
+main([RelVsn]) ->
+    {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
     OldRelPath = filename:join(["_rel","releases",RelVsn, RelName ++ ".rel"]),
     FilterFun = make_appname_filter(),
     {RelName, OldVsn, OldApps} = parse_rel_file(OldRelPath, "_rel/lib", FilterFun),
@@ -26,7 +28,8 @@ main([RelName, RelVsn]) ->
     compare_releases(OldRel, NewRel),
     ok;
 
-main([RelName, OldV, NewV]) ->
+main([OldV, NewV]) ->
+    {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
     FilterFun = make_appname_filter(),
     OldRelPath = filename:join(["_rel","releases",OldV, RelName ++ ".rel"]),
     NewRelPath = filename:join(["_rel","releases",NewV, RelName ++ ".rel"]),
@@ -55,16 +58,15 @@ compare_releases(OldRel = #release{name=RelName,vsn=OV},
     print_releases([OldRel, NewRel]),
     io:format("Comparing releases ~s: ~s  -->  ~s~n",[RelName, OV, NV]),
     OldApps = [ {App#app.name, App} || App <- OldRel#release.apps ],
+    %% only make appups for apps that are in the old AND new releases
     Apps = lists:filter(fun(A) ->
         proplists:get_value(A#app.name, OldApps) =/= undefined
     end, NewRel#release.apps),
-    AppUps = lists:map(fun(App) ->
+    AppUpDirectives = lists:map(fun(App) ->
         OldApp = proplists:get_value(App#app.name, OldApps),
-        AppUpPath = filename:join([App#app.path, "ebin", 
-                                   atom_to_list(App#app.name) ++ ".appup"]),
-        {AppUpPath, make_appup(OldApp, App)}
+        {App#app.name, OldApp#app.vsn, App#app.vsn, App, make_appup(OldApp, App)}
     end, Apps),
-    io:format("~p~n",[AppUps]).
+    process_appup_directives(AppUpDirectives).
 
 parse_local_appvers(Dirs) ->
     AppFiles = find_app_files(Dirs),
@@ -84,11 +86,21 @@ find_app_files([Dir|Dirs], Acc) ->
 
 make_appup(OldApp = #app{}, NewApp = #app{}) ->
     UpInstructions   = make_appup_instructions(OldApp, NewApp),
-    DownInstructions = reverse_appup_instructions(UpInstructions),
-    {NewApp#app.vsn,
-        [{OldApp#app.vsn, UpInstructions}],
-        [{OldApp#app.vsn, DownInstructions}]
-    }.
+    case UpInstructions of
+        [] when OldApp#app.vsn =:= NewApp#app.vsn ->
+            not_upgraded;
+        _  when OldApp#app.vsn =:= NewApp#app.vsn ->
+            {needs_version_bump, UpInstructions};
+        _ ->
+            AppUpPath = filename:join([NewApp#app.path, "ebin", 
+                                       atom_to_list(NewApp#app.name) ++ ".appup"]),
+            DownInstructions = reverse_appup_instructions(UpInstructions),
+            {appup, AppUpPath,
+                {NewApp#app.vsn,
+                    [{OldApp#app.vsn, UpInstructions}],
+                    [{OldApp#app.vsn, DownInstructions}]}
+            }
+    end.
 
 make_appup_instructions(OldApp = #app{}, NewApp = #app{}) ->
     OldMods = OldApp#app.mods,
@@ -101,9 +113,23 @@ make_appup_instructions(OldApp = #app{}, NewApp = #app{}) ->
                                                  sets:from_list(NewMods))),
     lists:flatten([
         [ {add_module, M} || M <- AddedMods ],
-        [ appup_instruction_for_module(M, OldApp, NewApp) || M <- SameMods ],
+        [ appup_instruction_for_module(M, OldApp, NewApp) || M <- sort_mods(SameMods) ],
         [ {delete_module, M} || M <- RemovedMods ]
     ]).
+
+%% Sort _sup modules first
+sort_mods(Mods) ->
+    lists:sort(
+        fun(A,B) ->
+                As = atom_to_list(A),
+                Bs = atom_to_list(B),
+                case {lists:suffix("_sup", As), lists:suffix("_sup", Bs)} of
+                    {true, false} -> true;
+                    {false, true} -> false;
+                    _             -> A =< B
+                end
+        end,
+    Mods).
 
 reverse_appup_instructions(L) ->
     reverse_appup_instructions(L,[]).
@@ -127,37 +153,39 @@ appup_instruction_for_module(M, OldApp, NewApp) ->
     case beam_lib:cmp(OldBeam, NewBeam) of
         ok ->
             [];
-        {error, beam_lib, ErrRsn} ->
-            io:format("beam_lib:cmp(~p) ~p~n",[M, ErrRsn]),
-            {module, M} = code:load_binary(M, "/tmp/undefined.beam", NewBeam),
-            NewInfo = parse_module_info(M:module_info()),
+        {error, beam_lib, _ErrRsn} ->
+            %io:format("beam_lib:cmp(~p) ~p~n",[M, ErrRsn]),
+            Minfo = extract_module_info(NewBeam),
             HasBehaviour = fun(B) ->
-                lists:member(B, proplists:get_value(behaviours, NewInfo, []))
+                lists:member(B, proplists:get_value(behaviours, Minfo, []))
+            end,
+            HasCodeChange = fun() ->
+                lists:member({code_change, 3}, Minfo) 
+                orelse
+                lists:member({code_change, 4}, Minfo)
             end,
             Instructions = case HasBehaviour(supervisor) of
-                true  -> appup_for_supervisor(M, OldApp, NewApp);
+                true  -> 
+                    appup_for_supervisor(M, Minfo, OldApp, NewApp);
                 false ->
-                    case module_has_code_change(M) of
+                    %% gen_server has code_change/3
+                    %% gen_fsm has code_change/4
+                    case HasCodeChange() of
                         true  -> appup_for_code_change(M, OldApp, NewApp);
                         false -> [{load_module, M}]
                     end
             end,
-            code:delete(M),
-            code:purge(M),
             Instructions
     end.
-
-module_has_code_change(M) ->
-    erlang:function_exported(M, code_change, 3) 
-    orelse
-    erlang:function_exported(M, code_change, 4).
 
 appup_for_code_change(M, OldApp, NewApp) ->
     [{update, M, {advanced, [OldApp#app.vsn, NewApp#app.vsn]}}].
 
-appup_for_supervisor(M, OldApp, NewApp) ->
+appup_for_supervisor(M, Minfo, OldApp, NewApp) ->
     I = {update, M, supervisor},
-    case erlang:function_exported(M, sup_upgrade_notify, 2) of
+    %% Support the Dukes of Erl erlrc convention:
+    case lists:member({sup_upgrade_notify, 2}, 
+            proplists:get_value(exports, Minfo, [])) of
         true ->
             [I, {apply, {M, sup_upgrade_notify, 
                          [OldApp#app.vsn, NewApp#app.vsn]}}];
@@ -165,12 +193,20 @@ appup_for_supervisor(M, OldApp, NewApp) ->
             [I]
     end.
 
-%% strip down module_info/0 response to the bits we care about
-parse_module_info(MI) ->
-    Attrs = proplists:get_value(attributes, MI),
-    Behaviours = proplists:get_value(behaviour, Attrs, []),
-    Exports = proplists:get_value(exports, MI, []),
-    [ 
+extract_module_info(Beam) ->
+    Chunker = fun(K) ->
+        case beam_lib:chunks(Beam, [K]) of
+            {ok, {_, [{K, Result}]}} -> Result;
+            _ -> []
+        end
+    end,
+    Exports = Chunker(exports),
+    %% Implement the "special relationship"
+    Behaviours = lists:usort(
+                    lists:flatten(
+                        proplists:get_value(behaviour, Chunker(attributes), []) ++ 
+                        proplists:get_value(behavior,  Chunker(attributes), []))),
+    [
         {behaviours, Behaviours},
         {exports, Exports}
     ].
@@ -221,3 +257,64 @@ print_releases([Rel|Rels]) ->
     print_releases(Rels).
 
 
+process_appup_directives(L) ->
+    [ process_appup_directive(D) || D <- L ].
+
+process_appup_directive({N, Va, Va, _App, not_upgraded}) ->
+    io:format("App '~s' version '~s' - not upgraded, no changes needed.~n",[N, Va]);
+
+process_appup_directive({N, Va, Va, App, {needs_version_bump, UpInstructions}}) ->
+    io:format("App '~s' version '~s' - changes detected, needs version bump.~n",[N, Va]),
+    AppFile = App#app.ebin ++ "/" ++ atom_to_list(App#app.name) ++ ".app",
+    {ok, Vn} = bump_app_version(AppFile),
+    DownInstructions = reverse_appup_instructions(UpInstructions),
+    Directive = {N, Va, Vn, App#app{vsn=Vn}, 
+                    {appup, AppFile ++ "up",
+                        {Vn,
+                            [{Va, UpInstructions}],
+                            [{Va, DownInstructions}]}
+                    }},
+    process_appup_directive(Directive);
+
+process_appup_directive({N, Va, Vb, _App, {appup, Path, Contents}}) ->
+    io:format("~s.appup generated for ~s --> ~s~n",[N, Va, Vb]),
+    io:format("~p~n", [Contents]),
+    io:format("Write: ~s~n", [Path]).
+
+%% increments app version in-place, in app file
+bump_app_version(Path) ->
+    {ok, [{application, AppName, Sections}]} = file:consult(Path),
+    Vsn = proplists:get_value(vsn, Sections),
+    NewVsn = next_version(Vsn),
+    NewSections = [{vsn, NewVsn} | proplists:delete(vsn, Sections)],
+    Contents = io_lib:format("~p.~n",[{application, AppName, NewSections}]),
+    io:format("rewrite ~s and change vsn: ~s --> ~s~n",[Path,Vsn,NewVsn]),
+    ok = file:write_file(Path, Contents),
+    %% Now replace the vsn in the .app.src file, if present:
+    Parts = filename:split(Path),
+    AppSrcPath = filename:join(lists:sublist(Parts, length(Parts)-2)) ++ "/src/" ++ atom_to_list(AppName)++".app.src",
+    case filelib:is_file(AppSrcPath) of
+        true ->
+            io:format("rewrite ~s and change vsn: ~s --> ~s~n",[AppSrcPath, Vsn, NewVsn]),
+            {ok, [{application, AppName, SrcSections}]} = file:consult(AppSrcPath),
+            SrcNewSections = [{vsn, NewVsn} | proplists:delete(vsn, SrcSections)],
+            SrcContents = io_lib:format("~p.~n",[{application, AppName, SrcNewSections}]),
+            ok = file:write_file(AppSrcPath, SrcContents);
+        false ->
+            io:format("skipping: ~s~n",[AppSrcPath]),
+            ok
+    end,
+    {ok, NewVsn}.
+
+next_version(Vsn) ->
+    YYYYMMDD = yyyymmdd(),
+    case Vsn of
+        [YYYYMMDD | P] ->
+            YYYYMMDD ++ [hd(P)+1];
+        _ ->
+            YYYYMMDD ++ "a"
+    end.
+
+yyyymmdd() ->
+    {{Y,M,D},_} = calendar:local_time(),
+    lists:flatten(io_lib:format("~4..0B~2..0B~2..0b",[Y,M,D])).
