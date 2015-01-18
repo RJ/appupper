@@ -1,0 +1,6 @@
+{application, appupper,
+ [{description, ".appup generator"},
+  {vsn, "1"},
+  {modules, []},
+  {registered, []},
+  {applications, [kernel, stdlib, getopt]}]}.

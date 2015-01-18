@@ -1,23 +1,93 @@
-#!/usr/bin/env escript
-%%! -noshell -noinput
-%% -*- mode: erlang;erlang-indent-level: 4;indent-tabs-mode: nil -*-
-%% ex: ft=erlang ts=4 sw=4 et
+-module(appupper).
+-compile(export_all).
+-export([main/1]).
+-include("appupper.hrl").
 -record(app, {name, vsn, path, ebin, mods=[]}).
 -record(release, {name, vsn, apps=[]}).
+
+-define(otp_apps, [
+    asn1, common_test, compiler, cosEvent, cosEventDomain, cosFileTransfer,
+    cosNotification, cosProperty, cosTime, cosTransactions, crypto, debugger,
+    dialyzer, diameter, edoc, eldap, erl_docgen, erl_interface, erts, et,
+    eunit, gs, hipe, ic, inets, jinterface, kernel, megaco, mnesia, observer,
+    odbc, orber, os_mon, ose, otp_mibs, parsetools, percept, public_key,
+    reltool, runtime_tools, sasl, snmp, ssh, ssl, stdlib, syntax_tools,
+    test_server, tools, typer, webtool, wx, xmerl
+]).
 
 %% Design notes:
 %% 1) Construct two #releases{} containing a list of #app{} each
 %% 2) Compare apps from the two releases, and generate .appups
 %% 3) Profit.
 
-main([]) ->
-    %% Detect version of most recent release to be built:
-    {ok, [[{release, _RelName, RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
-    io:format("Comparing local with ~s~n",[RelVer]),
-    main([RelVer]);
+main(Args) ->
+    case appupper_cli:parse_args(Args) of
+        {ok, State = #state{}} -> run(State);
+        _ -> init:stop(1)
+    end.
+
+%-record(state, {
+        %relname
+    %,   relpath
+    %,   upfrom
+    %,   relvsn
+%}).
+
+stderr(S) -> stderr(S,[]).
+stderr(S,A) -> io:put_chars(standard_error, [io_lib:format(S,A),"\n"]).
+
+run(State = #state{}) ->
+    io:format("# RUN ~p~n",[State]),
+    try
+        run_directives(State#state.directives, State)
+    catch
+        throw:{err, S, A} ->
+            stderr(S,A),
+            init:stop(1)
+    end.
+
+run_directives([], State) ->
+    State;
+
+run_directives([appups|Directives], State) ->
+    Diff = diff_rels(State),
+    io:format("~p\n",[Diff]),
+    run_directives(Directives, State);
+
+run_directives([listrels|Directives], State) ->
+    Rels = list_releases(State),
+    io:format("~p\n",[Rels]),
+    run_directives(Directives, State).
+
+list_releases(#state{relpath=Relpath}) ->
+    Dir = Relpath ++ "/releases/",
+    case file:list_dir("_rel/relsandbox/releases") of
+        {ok, Files} ->
+            lists:reverse(lists:foldl(fun(F, Acc) ->
+                Path = Dir ++ F,
+                case filelib:is_dir(Path) of
+                    true -> [{F, Path}|Acc];
+                    false -> Acc
+                end
+            end, [], Files));
+        {error, _Err} ->
+            throw({err, "No releases dir found @ ~s", [Dir]})
+    end.
+
+diff_rels(State=#state{upfrom=OldV,relname=RelName}) ->
+    OldRelPath = filename:join([State#state.relpath,"releases",OldV, RelName ++ ".rel"]),
+    io:format("oldrelpath: ~s\n",[OldRelPath]),
+    FilterFun = fun(_) -> true end,
+    {RelName, OldVsn, OldApps} = parse_rel_file(OldRelPath, "_rel/"++RelName++"/lib", FilterFun),
+    io:format("OLD vsn: ~p apps: ~p\n",[OldVsn, OldApps]),
+    ok.
+
+%read_appfile_props(File) ->
+    %{ok, [{application, _AppName, Props}]} = file:consult(File),
+    %Props.
 
 %% working copy vs last _rel version
-main([RelVsn]) ->
+xmain([RelVsn]) ->
     {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
     OldRelPath = filename:join(["_rel","releases",RelVsn, RelName ++ ".rel"]),
     FilterFun = make_appname_filter(),
@@ -28,7 +98,7 @@ main([RelVsn]) ->
     compare_releases(OldRel, NewRel),
     ok;
 
-main([OldV, NewV]) ->
+xmain([OldV, NewV]) ->
     {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
     FilterFun = make_appname_filter(),
     OldRelPath = filename:join(["_rel","releases",OldV, RelName ++ ".rel"]),
@@ -40,7 +110,7 @@ main([OldV, NewV]) ->
     compare_releases(OldRel, NewRel),
     ok;
 
-main(_) ->
+xmain(_) ->
     io:format("Usage: not like that.\n").
 
 %% 
@@ -212,6 +282,7 @@ extract_module_info(Beam) ->
     ].
 
 parse_app_file(Path) ->
+    io:format("parse_app_file ~s\n",[Path]),
     {ok, [{application, AppName, Sections}]} = file:consult(Path),
     Vsn = proplists:get_value(vsn, Sections),
     Mods = proplists:get_value(modules, Sections),
@@ -228,6 +299,7 @@ parse_rel_file(Path, LibsDir, FilterFun) ->
         AppName = atom_to_list(AppNameA),
         filename:join([LibsDir, AppName ++ "-" ++ AppVer, "ebin", AppName ++ ".app"])
     end, AppVers),
+    io:format("APPFILES: ~p\n",[AppFiles]),
     Apps0 = [ parse_app_file(F) || F <- AppFiles ],
     Apps = lists:filter(fun(#app{name=Name}) ->
         FilterFun(atom_to_list(Name))
