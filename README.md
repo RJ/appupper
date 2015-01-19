@@ -1,7 +1,6 @@
 # Appupper - Automatic .appup generation
 
-It's intended to work alongside ````relx````, and reads the
-````relx.config````
+It's intended to work alongside ````relx````, and reads the ````relx.config````
 
 ## Build and install
 
