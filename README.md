@@ -1,6 +1,9 @@
 # Appupper - Automatic .appup generation
 
-It's intended to work alongside ````relx````, and reads the ````relx.config````
+Possible rename: autorel?
+
+It's intended to work alongside ````relx````, since it expects to find
+your previous release under ````./_rel/$relname````
 
 ## Build and install
 
@@ -9,27 +12,31 @@ Create a standalone executable escript and copy into your PATH:
     $ make
     $ sudo cp ./appupper /usr/bin/
 
-## Raison d'être
+## Workflow Example
 
-To automatically bump versions of apps and the release, and create
-suitable appup files. So you can just change one .erl file, run this
-tool, and be ready to ````relx release relup```` without further ado.
+Your last deployed release was versioned "1.0.0", and as such you have a
+````./_rel/$relname/releases/1.0.0```` dir, and associated
+````./_rel/$relname/lib/...```` dirs.
 
-Should probably enforce that there are no uncommitted mods, so we get
-one clean commit with our appup related changes.
+You make some changes to various ````.erl```` files, run ````rebar
+compile````, test, and are ready to create+deploy the release.
 
-## Usage
+    $ appupper -u 1.0.0 -n $relname --appups
 
-You have a _rel/myrelease directory, and have built your first release.
-ie, the _rel/myrelease/releases/1 directory exists.
+This will figure out which app versions to increment, do so by modifying
+the relevant .app and .app.src files in-place, write out appropriate
+.appup files for changed applications, and then increment the release
+version in relx.config in-place.
 
-You edit an .erl file and recompile. Time to bump the version in the
-.app/.app.src file for the application that module belongs to, and also
-to bump the release version, from the relx.config.
+At this point, review what changed with git diff.
 
-We'll also need an appropriate .appup file to load the changed module in
-the new version of the application.
+Now you're ready to:
 
+    $ relx -u 1.0.0 -v 1.1.0 -n $relname release relup
 
+and at no point did you have to mess around incrementing versions of
+apps and releases or write the appup files (just review the auto-genned
+ones, and possibly edit if needed).
 
-
+Next step is to turn that into debs using the as-yet unreleased new
+tool, or just append "tar" to the relx command to deploy with tarball.
