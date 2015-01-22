@@ -209,7 +209,7 @@ make_appup_instructions(OldApp = #app{}, NewApp = #app{}) ->
     RemovedMods = lists:dropwhile(fun(E)->lists:member(E,NewMods)end, OldMods),
     SameMods    = sets:to_list(sets:intersection(sets:from_list(OldMods),
                                                  sets:from_list(NewMods))),
-    Instructions = [ appup_instruction_for_module(M, OldApp, NewApp) || M <- sort_mods(SameMods) ],
+    Instructions = lists:flatten([ appup_instruction_for_module(M, OldApp, NewApp) || M <- sort_mods(SameMods) ]),
     %% Figure out if it's a minor or patch bump.
     %% patch bumps are all load_modules
     Level = case lists:filter(fun({load_module,_}) -> false ; (_) -> true end, Instructions) of
