@@ -2,7 +2,7 @@
 -compile(export_all).
 -export([main/1]).
 -include("appupper.hrl").
--record(app, {name, vsn, path, ebin, mods=[]}).
+-record(app, {name, vsn, src, ebin, mods=[]}).
 -record(release, {name, vsn, apps=[]}).
 
 -define(otp_apps, [
@@ -37,7 +37,7 @@ stderr(S) -> stderr(S,[]).
 stderr(S,A) -> io:put_chars(standard_error, [io_lib:format(S,A),"\n"]).
 
 run(State = #state{}) ->
-    io:format("# RUN ~p~n",[State]),
+    %io:format("# RUN ~p~n",[State]),
     try
         run_directives(State#state.directives, State)
     catch
@@ -50,13 +50,12 @@ run_directives([], State) ->
     State;
 
 run_directives([appups|Directives], State) ->
-    Diff = diff_rels(State),
-    io:format("~p\n",[Diff]),
-    run_directives(Directives, State);
+    NewState = do_appups(State),
+    run_directives(Directives, NewState);
 
 run_directives([listrels|Directives], State) ->
     Rels = list_releases(State),
-    io:format("~p\n",[Rels]),
+    %io:format("~p\n",[Rels]),
     run_directives(Directives, State).
 
 list_releases(#state{relpath=Relpath}) ->
@@ -74,69 +73,107 @@ list_releases(#state{relpath=Relpath}) ->
             throw({err, "No releases dir found @ ~s", [Dir]})
     end.
 
-diff_rels(State=#state{upfrom=OldV,relname=RelName}) ->
+get_oldrel_info(State=#state{upfrom=OldV,relname=RelName}) ->
     OldRelPath = filename:join([State#state.relpath,"releases",OldV, RelName ++ ".rel"]),
-    io:format("oldrelpath: ~s\n",[OldRelPath]),
+    %io:format("oldrelpath: ~s\n",[OldRelPath]),
     FilterFun = fun(_) -> true end,
     {RelName, OldVsn, OldApps} = parse_rel_file(OldRelPath, "_rel/"++RelName++"/lib", FilterFun),
-    io:format("OLD vsn: ~p apps: ~p\n",[OldVsn, OldApps]),
-    ok.
+    {OldVsn, OldApps}.
 
-%read_appfile_props(File) ->
-    %{ok, [{application, _AppName, Props}]} = file:consult(File),
-    %Props.
 
-%% working copy vs last _rel version
-xmain([RelVsn]) ->
-    {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
-    OldRelPath = filename:join(["_rel","releases",RelVsn, RelName ++ ".rel"]),
-    FilterFun = make_appname_filter(),
-    {RelName, OldVsn, OldApps} = parse_rel_file(OldRelPath, "_rel/lib", FilterFun),
-    OldRel = #release{name=RelName, vsn=OldVsn, apps=OldApps},
-    NewApps = parse_local_appvers(["apps"]),
-    NewRel = OldRel#release{vsn="new", apps=NewApps},
-    compare_releases(OldRel, NewRel),
-    ok;
+do_appups(State = #state{}) ->
+    {OldVsn, AllOldApps} = get_oldrel_info(State),
+    %io:format("OLD vsn: ~p apps: ~p\n",[OldVsn, AllOldApps]),
+    %% based on old release, find the local paths to the apps from the old rel
+    %% and then check if any of the modules are new/changed, so we can generate
+    %% appups.
+    %% Apps will either be in deps/ or src,ebin or apps/*/src,ebin
+    AllCurrentApps = parse_local_appvers(["ebin", "apps", "deps"]),
+    %io:format("NEW apps (all): ~p\n",[AllCurrentApps]),
 
-xmain([OldV, NewV]) ->
-    {ok, [[{release, RelName, _RelVer, _, _, _}]]} = file:consult("_rel/releases/RELEASES"),
-    FilterFun = make_appname_filter(),
-    OldRelPath = filename:join(["_rel","releases",OldV, RelName ++ ".rel"]),
-    NewRelPath = filename:join(["_rel","releases",NewV, RelName ++ ".rel"]),
-    {RelName, OldVsn, OldApps} = parse_rel_file(OldRelPath, "_rel/lib", FilterFun),
-    {RelName, NewVsn, NewApps} = parse_rel_file(NewRelPath, "_rel/lib", FilterFun),
-    OldRel = #release{name=RelName, vsn=OldVsn, apps=OldApps},
-    NewRel = #release{name=RelName, vsn=NewVsn, apps=NewApps},
-    compare_releases(OldRel, NewRel),
-    ok;
+    %% since we dont need appup instructions for added/removed apps, just find
+    %% the list of new apps that also are in the old release, for diffing.
+    %% we want a list of [ {OldApp, NewApp}, ... ]
+    AppPairs = lists:foldl(
+        fun(OldApp, Acc) ->
+            case lists:keyfind(OldApp#app.name, #app.name, AllCurrentApps) of
+                false -> Acc;
+                CurrApp -> [ {OldApp, CurrApp} | Acc ]
+            end
+        end, [], AllOldApps),
 
-xmain(_) ->
-    io:format("Usage: not like that.\n").
+    %io:format("Apps to diff: ~p\n",[AppPairs]),
+    AppPlans = lists:map(fun(Pair={OApp,NApp}) ->
+        Plan = make_appup(Pair),
+        {OApp,NApp,Plan}
+    end, AppPairs),
 
-%% 
-make_appname_filter() ->
-    %% only consider app names ^irc.* for testing
-    fun(N) ->
-        case N of
-            "irc"++_ -> true;
-            _        -> false
-        end
+    %io:format("APPPLANS:~p\n",[AppPlans]),
+    print_app_plans(AppPlans),
+    case prompt_yn("Write .appup(s) and bump versions?", true) of
+        true ->
+            process_app_plans(AppPlans),
+            RelxFile = "./relx.config",
+            {ok, NewRelVsn} = appupper_versionbumper:bump_relx_vsn(RelxFile, list_to_atom(State#state.relname), State#state.upfrom),
+            State;
+        false ->
+            State
     end.
 
-compare_releases(OldRel = #release{name=RelName,vsn=OV}, 
-                 NewRel = #release{vsn=NV}) ->
-    print_releases([OldRel, NewRel]),
-    io:format("Comparing releases ~s: ~s  -->  ~s~n",[RelName, OV, NV]),
-    OldApps = [ {App#app.name, App} || App <- OldRel#release.apps ],
-    %% only make appups for apps that are in the old AND new releases
-    Apps = lists:filter(fun(A) ->
-        proplists:get_value(A#app.name, OldApps) =/= undefined
-    end, NewRel#release.apps),
-    AppUpDirectives = lists:map(fun(App) ->
-        OldApp = proplists:get_value(App#app.name, OldApps),
-        {App#app.name, OldApp#app.vsn, App#app.vsn, App, make_appup(OldApp, App)}
-    end, Apps),
-    process_appup_directives(AppUpDirectives).
+process_app_plans(L) ->
+    [ process_app_plan(D) || D <- L ].
+
+process_app_plan({_OApp, _NApp=#app{name=Appname,vsn=Vsn}, not_upgraded}) ->
+    io:format("App '~s' version '~s' - not upgraded, no changes needed.~n",[Appname, Vsn]);
+
+process_app_plan({OApp,NApp,{needs_version_bump, UpInstructions, Level}}) when is_atom(Level) ->
+    %% we know we need to dump the app vsn at this point.
+    #app{name=Appname,vsn=CurrVsn} = OApp,
+    io:format("App '~s' version '~s' - changes detected, needs version bump.~n",[Appname, CurrVsn]),
+    AppSrcFile = NApp#app.src  ++ "/" ++ atom_to_list(NApp#app.name) ++ ".app.src",
+    AppFile    = NApp#app.ebin ++ "/" ++ atom_to_list(NApp#app.name) ++ ".app",
+    {ok, CurrVsn, NewVsn} = appupper_versionbumper:bump_dot_apps(AppSrcFile, AppFile, Level),
+    DownInstructions = reverse_appup_instructions(UpInstructions),
+    AppUpTerm = {NewVsn,
+                 [{CurrVsn, UpInstructions}],
+                 [{CurrVsn, DownInstructions}]
+                },
+    AppUpPath = NApp#app.ebin ++ "/" ++ atom_to_list(NApp#app.name) ++ ".appup",
+    %% TODO what if this vsn->vsn upgrade term exists in appup already
+    ok = file:write_file(AppUpPath, io_lib:format("~p.\n\n",[AppUpTerm])),
+    io:format("Wrote ~s\n",[AppUpPath]),
+    ok.
+
+%process_app_plan({N, Va, Vb, _App, {appup, Path, Contents}}) ->
+    %io:format("~s.appup generated for ~s --> ~s~n",[N, Va, Vb]),
+    %io:format("~p~n", [Contents]),
+    %case filelib:is_file(Path) of
+        %true ->
+            %{ok, Terms} = file:consult(Path),
+            %case lists:member(Contents, Terms) of
+                %true ->
+                    %io:format("Identical directive already in file.~n");
+                %false ->
+                    %NewContents = prep_appfile_contents([ 
+                            %Contents | remove_appup(Terms, Va, Vb) ]),
+                    %ok = file:write_file(Path, NewContents),
+                    %io:format("Wrote: ~s~n", [Path])
+            %end;
+        %false ->
+            %ok = file:write_file(Path, prep_appfile_contents([Contents]))
+    %end.
+
+print_app_plans(Plans) ->
+    lists:foreach(
+        fun ({OApp, App, not_upgraded}) ->
+                io:format("~20.. s    no change @ ~s\n",[App#app.name, App#app.vsn]);
+            ({OApp, App, {needs_version_bump,Instrs,Level}}) ->
+                NewVsn = appupper_versionbumper:bump_version(App#app.vsn, Level),
+                io:format("~20.. s    APPUP ~s -> ~s\n",[App#app.name, App#app.vsn, NewVsn]),
+                lists:foreach(fun(Inst) ->
+                    io:format("                         * ~p\n",[Inst])
+                end, Instrs)
+        end, Plans).
 
 parse_local_appvers(Dirs) ->
     AppFiles = find_app_files(Dirs),
@@ -154,22 +191,13 @@ find_app_files([Dir|Dirs], Acc) ->
                                   fun(F,A) -> [F|A] end, []),
     find_app_files(Dirs, Acc ++ AppFiles).
 
-make_appup(OldApp = #app{}, NewApp = #app{}) ->
-    UpInstructions   = make_appup_instructions(OldApp, NewApp),
+make_appup({OldApp = #app{}, NewApp = #app{}}) ->
+    {UpInstructions, Level} = make_appup_instructions(OldApp, NewApp),
     case UpInstructions of
         [] when OldApp#app.vsn =:= NewApp#app.vsn ->
             not_upgraded;
-        _  when OldApp#app.vsn =:= NewApp#app.vsn ->
-            {needs_version_bump, UpInstructions};
-        _ ->
-            AppUpPath = filename:join([NewApp#app.path, "ebin", 
-                                       atom_to_list(NewApp#app.name) ++ ".appup"]),
-            DownInstructions = reverse_appup_instructions(UpInstructions),
-            {appup, AppUpPath,
-                {NewApp#app.vsn,
-                    [{OldApp#app.vsn, UpInstructions}],
-                    [{OldApp#app.vsn, DownInstructions}]}
-            }
+        _L when is_list(_L) ->
+            {needs_version_bump, UpInstructions, Level}
     end.
 
 make_appup_instructions(OldApp = #app{}, NewApp = #app{}) ->
@@ -181,11 +209,19 @@ make_appup_instructions(OldApp = #app{}, NewApp = #app{}) ->
     RemovedMods = lists:dropwhile(fun(E)->lists:member(E,NewMods)end, OldMods),
     SameMods    = sets:to_list(sets:intersection(sets:from_list(OldMods),
                                                  sets:from_list(NewMods))),
-    lists:flatten([
+    Instructions = [ appup_instruction_for_module(M, OldApp, NewApp) || M <- sort_mods(SameMods) ],
+    %% Figure out if it's a minor or patch bump.
+    %% patch bumps are all load_modules
+    Level = case lists:filter(fun({load_module,_}) -> false ; (_) -> true end, Instructions) of
+        [] -> patch;
+        _  -> minor
+    end,
+    FinalInstructions = lists:flatten([
         [ {add_module, M} || M <- AddedMods ],
-        [ appup_instruction_for_module(M, OldApp, NewApp) || M <- sort_mods(SameMods) ],
+        Instructions,
         [ {delete_module, M} || M <- RemovedMods ]
-    ]).
+    ]),
+    {FinalInstructions, Level}.
 
 %% Sort _sup modules first
 sort_mods(Mods) ->
@@ -214,38 +250,51 @@ reverse_appup_instruction({update, M, {advanced, [A,B]}}) -> {update, M, {advanc
 reverse_appup_instruction({apply, {M, sup_upgrade_notify, [A,B]}}) -> {apply, {M, sup_upgrade_notify, [B,A]}};
 reverse_appup_instruction(Other) -> Other.
 
-appup_instruction_for_module(M, OldApp, NewApp) ->
-    OldBeamPath = OldApp#app.path ++ "/ebin/" ++ atom_to_list(M) ++ ".beam",
-    NewBeamPath = NewApp#app.path ++ "/ebin/" ++ atom_to_list(M) ++ ".beam",
-    {ok, OldBeam} = file:read_file(OldBeamPath),
-    {ok, NewBeam} = file:read_file(NewBeamPath),
-    %% Is the new module different to the old module?
-    case beam_lib:cmp(OldBeam, NewBeam) of
-        ok ->
-            [];
-        {error, beam_lib, _ErrRsn} ->
-            %io:format("beam_lib:cmp(~p) ~p~n",[M, ErrRsn]),
-            Minfo = extract_module_info(NewBeam),
-            HasBehaviour = fun(B) ->
-                lists:member(B, proplists:get_value(behaviours, Minfo, []))
-            end,
-            HasCodeChange = fun() ->
-                lists:member({code_change, 3}, Minfo) 
-                orelse
-                lists:member({code_change, 4}, Minfo)
-            end,
-            Instructions = case HasBehaviour(supervisor) of
-                true  -> 
-                    appup_for_supervisor(M, Minfo, OldApp, NewApp);
+%% detect nature of change to a beam file
+beam_diff(PathA, PathB) when PathA == PathB ->
+    false;
+beam_diff(PathA, PathB) ->
+    {ok, BeamA} = file:read_file(PathA),
+    {ok, BeamB} = file:read_file(PathB),
+    case BeamA == BeamB of
+        true  -> false; %% same file contents
+        false -> beam_diff_type(BeamA, BeamB)
+    end.
+
+beam_diff_type(BeamA, BeamB) when is_binary(BeamA), is_binary(BeamB) ->
+    Minfo = extract_module_info(BeamB),
+    HasBehaviour = fun(B) ->
+        lists:member(B, proplists:get_value(behaviours, Minfo, []))
+    end,
+    HasCodeChange = lists:member({code_change, 3}, Minfo) orelse
+                        lists:member({code_change, 4}, Minfo),
+    case HasBehaviour(supervisor) of
+        true ->
+            {supervisor, Minfo};
+        false ->
+            case HasCodeChange of
+                true ->
+                    case did_state_record_change(BeamA, BeamB) of
+                        true  -> code_change;
+                        false -> load_module
+                    end;
                 false ->
-                    %% gen_server has code_change/3
-                    %% gen_fsm has code_change/4
-                    case HasCodeChange() of
-                        true  -> appup_for_code_change(M, OldApp, NewApp);
-                        false -> [{load_module, M}]
-                    end
-            end,
-            Instructions
+                    load_module
+            end
+    end.
+
+appup_instruction_for_module(M, OldApp, NewApp) ->
+    OldBeamPath = filename:join([OldApp#app.ebin, atom_to_list(M) ++ ".beam"]),
+    NewBeamPath = filename:join([NewApp#app.ebin, atom_to_list(M) ++ ".beam"]),
+    case beam_diff(OldBeamPath, NewBeamPath) of
+        false ->
+            [];
+        load_module ->
+            [{load_module, M}];
+        {supervisor, Minfo} ->
+            appup_for_supervisor(M, Minfo, OldApp, NewApp);
+        code_change ->
+            appup_for_code_change(M, OldApp, NewApp)
     end.
 
 appup_for_code_change(M, OldApp, NewApp) ->
@@ -253,15 +302,38 @@ appup_for_code_change(M, OldApp, NewApp) ->
 
 appup_for_supervisor(M, Minfo, OldApp, NewApp) ->
     I = {update, M, supervisor},
-    %% Support the Dukes of Erl erlrc convention:
-    case lists:member({sup_upgrade_notify, 2}, 
+    %% Support the Dukes of Erl erlrc convention
+    %% ie. call sup_upgrade_notify/2 if exported.
+    case lists:member({sup_upgrade_notify, 2},
             proplists:get_value(exports, Minfo, [])) of
         true ->
-            [I, {apply, {M, sup_upgrade_notify, 
-                         [OldApp#app.vsn, NewApp#app.vsn]}}];
+            %% bit of a nasty assumption here, we don't know the new app vsn yet
+            %% so we assume it's a minor bump. can't be patch bump since there
+            %% is a change to a supervisor.
+            [I, {apply, {M, sup_upgrade_notify,
+                         [OldApp#app.vsn, appupper_versionbumper:bump_version(OldApp#app.vsn,minor)]}}];
         false ->
             [I]
     end.
+
+
+read_beam_records(Beam) ->
+    AbstChunks = beam_lib:chunks(Beam,[abstract_code]),
+    {ok, {_ModName, [{abstract_code, {raw_abstract_v1, AC}}]}} = AbstChunks,
+    Recs = lists:foldl(fun
+        ({attribute,_Line,record,RecTuple={_RecName,_RecInfo}},Acc) ->
+            [RecTuple|Acc];
+        (_, Acc) ->
+            Acc
+    end, [], AC),
+    lists:sort(Recs).
+
+%% would be better to use the abstract code to detect the record name
+%% returned from init/1, ie {ok, #state{}}, and check if that has changed.
+%% but 99.9% of the time it's called 'state', so this will do for now.
+did_state_record_change(BeamA, BeamB) ->
+    proplists:get_value(state, read_beam_records(BeamA)) /=
+        proplists:get_value(state, read_beam_records(BeamB)).
 
 extract_module_info(Beam) ->
     Chunker = fun(K) ->
@@ -271,10 +343,10 @@ extract_module_info(Beam) ->
         end
     end,
     Exports = Chunker(exports),
-    %% Implement the "special relationship"
+    %% Tidy up the americanised spelling of behaviour
     Behaviours = lists:usort(
                     lists:flatten(
-                        proplists:get_value(behaviour, Chunker(attributes), []) ++ 
+                        proplists:get_value(behaviour, Chunker(attributes), []) ++
                         proplists:get_value(behavior,  Chunker(attributes), []))),
     [
         {behaviours, Behaviours},
@@ -282,24 +354,29 @@ extract_module_info(Beam) ->
     ].
 
 parse_app_file(Path) ->
-    io:format("parse_app_file ~s\n",[Path]),
+    %io:format("parse_app_file ~s\n",[Path]),
     {ok, [{application, AppName, Sections}]} = file:consult(Path),
     Vsn = proplists:get_value(vsn, Sections),
     Mods = proplists:get_value(modules, Sections),
     PathParts = filename:split(Path),
-    %% assuming ..../appname/ebin/appname.app strip off /ebin/appname.app
-    AppPath = filename:join(lists:sublist(PathParts, length(PathParts)-2)),
-    Ebin = filename:join([AppPath, "ebin"]),
-    #app{name=AppName, vsn=Vsn, path=AppPath, ebin=Ebin, mods=Mods}.
+    EbinPath = absname(filename:join(lists:sublist(PathParts, length(PathParts)-1))),
+    SrcPath = absname(filename:join([EbinPath, "..", "src"])),
+    #app{name=AppName, vsn=Vsn, src=SrcPath, ebin=EbinPath, mods=Mods}.
 
 parse_rel_file(Path, LibsDir, FilterFun) ->
     {ok, [Term]} = file:consult(Path),
     {release, {RelName, RelVsn}, {erts, _ErtsVsn}, AppVers} = Term,
-    AppFiles = lists:map(fun({AppNameA,AppVer}) ->
-        AppName = atom_to_list(AppNameA),
-        filename:join([LibsDir, AppName ++ "-" ++ AppVer, "ebin", AppName ++ ".app"])
-    end, AppVers),
-    io:format("APPFILES: ~p\n",[AppFiles]),
+    %% filter out the OTP-provided apps:
+    AppFiles = lists:foldl(fun({AppNameA,AppVer}, Acc) ->
+        case lists:member(AppNameA, ?otp_apps) of
+            true -> Acc;
+            false ->
+                AppName = atom_to_list(AppNameA),
+                AppFile = filename:join([LibsDir, AppName ++ "-" ++ AppVer, "ebin", AppName ++ ".app"]),
+                [AppFile | Acc]
+        end
+    end, [], AppVers),
+    %io:format("APPFILES: ~p\n",[AppFiles]),
     Apps0 = [ parse_app_file(F) || F <- AppFiles ],
     Apps = lists:filter(fun(#app{name=Name}) ->
         FilterFun(atom_to_list(Name))
@@ -310,62 +387,6 @@ parse_rel_file(Path, LibsDir, FilterFun) ->
 %% sort [#app{},...] by name
 sort_apps(Apps) -> lists:sort(fun(#app{name=A},#app{name=B}) -> A =< B end, Apps).
 
-%%
-%% PRINT HELPERS
-%%
-
-print_apps_summary(Apps) ->
-    AppsSummary = [
-        io_lib:format("~20.. s\t~15.. s\t  ~B\t~s~n",[A#app.name,A#app.vsn,length(A#app.mods),A#app.path])
-        || A <- Apps],
-    io:format("~s~n",[iolist_to_binary(AppsSummary)]).
-
-print_releases([]) -> ok;
-print_releases([Rel|Rels]) ->
-    io:format("RELEASE: ~s~nVERSION: ~s~nNUM APPS: ~B~nAPPS:~n",
-              [Rel#release.name, Rel#release.vsn, length(Rel#release.apps)]),
-    print_apps_summary(Rel#release.apps),
-    io:format("~n"),
-    print_releases(Rels).
-
-
-process_appup_directives(L) ->
-    [ process_appup_directive(D) || D <- L ].
-
-process_appup_directive({N, Va, Va, _App, not_upgraded}) ->
-    io:format("App '~s' version '~s' - not upgraded, no changes needed.~n",[N, Va]);
-
-process_appup_directive({N, Va, Va, App, {needs_version_bump, UpInstructions}}) ->
-    io:format("App '~s' version '~s' - changes detected, needs version bump.~n",[N, Va]),
-    AppFile = App#app.ebin ++ "/" ++ atom_to_list(App#app.name) ++ ".app",
-    {ok, Vn} = bump_app_version(AppFile),
-    DownInstructions = reverse_appup_instructions(UpInstructions),
-    Directive = {N, Va, Vn, App#app{vsn=Vn}, 
-                    {appup, AppFile ++ "up",
-                        {Vn,
-                            [{Va, UpInstructions}],
-                            [{Va, DownInstructions}]}
-                    }},
-    process_appup_directive(Directive);
-
-process_appup_directive({N, Va, Vb, _App, {appup, Path, Contents}}) ->
-    io:format("~s.appup generated for ~s --> ~s~n",[N, Va, Vb]),
-    io:format("~p~n", [Contents]),
-    case filelib:is_file(Path) of
-        true ->
-            {ok, Terms} = file:consult(Path),
-            case lists:member(Contents, Terms) of
-                true ->
-                    io:format("Identical directive already in file.~n");
-                false ->
-                    NewContents = prep_appfile_contents([ 
-                            Contents | remove_appup(Terms, Va, Vb) ]),
-                    ok = file:write_file(Path, NewContents),
-                    io:format("Wrote: ~s~n", [Path])
-            end;
-        false ->
-            ok = file:write_file(Path, prep_appfile_contents([Contents]))
-    end.
 
 prep_appfile_contents(Terms) ->
     [
@@ -381,40 +402,38 @@ remove_appup(Terms, Va, Vb) ->
                  end,
                  Terms).
 
-%% increments app version in-place, in app file
-bump_app_version(Path) ->
-    {ok, [{application, AppName, Sections}]} = file:consult(Path),
-    Vsn = proplists:get_value(vsn, Sections),
-    NewVsn = next_version(Vsn),
-    NewSections = [{vsn, NewVsn} | proplists:delete(vsn, Sections)],
-    Contents = io_lib:format("~p.~n",[{application, AppName, NewSections}]),
-    io:format("rewrite ~s and change vsn: ~s --> ~s~n",[Path,Vsn,NewVsn]),
-    ok = file:write_file(Path, Contents),
-    %% Now replace the vsn in the .app.src file, if present:
-    Parts = filename:split(Path),
-    AppSrcPath = filename:join(lists:sublist(Parts, length(Parts)-2)) ++ "/src/" ++ atom_to_list(AppName)++".app.src",
-    case filelib:is_file(AppSrcPath) of
-        true ->
-            io:format("rewrite ~s and change vsn: ~s --> ~s~n",[AppSrcPath, Vsn, NewVsn]),
-            {ok, [{application, AppName, SrcSections}]} = file:consult(AppSrcPath),
-            SrcNewSections = [{vsn, NewVsn} | proplists:delete(vsn, SrcSections)],
-            SrcContents = io_lib:format("~p.~n",[{application, AppName, SrcNewSections}]),
-            ok = file:write_file(AppSrcPath, SrcContents);
-        false ->
-            io:format("skipping: ~s~n",[AppSrcPath]),
-            ok
-    end,
-    {ok, NewVsn}.
 
-next_version(Vsn) ->
-    YYYYMMDD = yyyymmdd(),
-    case Vsn of
-        [YYYYMMDD | P] ->
-            YYYYMMDD ++ [hd(P)+1];
-        _ ->
-            YYYYMMDD ++ "a"
+%% via http://www.codecodex.com/wiki/Determine_if_two_file_paths_refer_to_the_same_file
+%% hope it works properly..
+absname(Path) ->
+    Path2 = filename:split(Path),
+    case string:chr(hd(Path2), $/) of
+        0 -> {ok, Cwd} = file:get_cwd(),
+             Abs = lists:reverse(filename:split(Cwd)),
+             absname(Path2, Abs);
+        _ -> absname(Path2, [])
     end.
 
-yyyymmdd() ->
-    {{Y,M,D},_} = calendar:local_time(),
-    lists:flatten(io_lib:format("~4..0B~2..0B~2..0b",[Y,M,D])).
+absname([], Absname) ->
+    filename:join(lists:reverse(Absname));
+absname([H|T], Absname) ->
+    case H of
+        "."  -> absname(T, Absname);
+        ".." -> absname(T, tl(Absname));
+        _    -> absname(T, [H|Absname])
+    end.
+
+prompt_yn(Prompt, Default) when is_boolean(Default) ->
+    YN = case Default of
+        true -> "Yn";
+        false -> "yN"
+    end,
+    Str = lists:flatten(io_lib:format("~s [~s] > ", [Prompt, YN])),
+    case io:get_line(Str) of
+        "\n"  -> Default;
+        "y\n" -> true;
+        "Y\n" -> true;
+        "n\n" -> false;
+        "N\n" -> false;
+        _ -> false
+    end.

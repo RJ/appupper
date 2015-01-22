@@ -32,8 +32,8 @@ opt_specs() ->
       "The path to the releases dir (contains ./releases/ dir)"},
      {upfrom, $u, "upfrom", string,
       "The release version to upgrade from"},
-     {relvsn, $v, "relvsn", string,
-      "The new release version"},
+     %{relvsn, $v, "relvsn", string,
+      %"The new release version"},
      {listrels, $l, "listrels", undefined,
       "Print list of release versions appupper can find"},
      {appups, $a, "appups", undefined,
@@ -64,9 +64,9 @@ opt2state([{relname, N} | Opts], State) ->
 opt2state([{relpath, P} | Opts], State) ->
     opt2state(Opts, State#state{relpath=P});
 opt2state([{upfrom, U} | Opts], State) ->
-    opt2state(Opts, State#state{upfrom=U});
-opt2state([{relvsn, V} | Opts], State) ->
-    opt2state(Opts, State#state{relvsn=V}).
+    opt2state(Opts, State#state{upfrom=U}).
+%opt2state([{relvsn, V} | Opts], State) ->
+    %opt2state(Opts, State#state{relvsn=V}).
 
 %% TODO read defaults from relx.config?
 fix_state(S=#state{relname=RN, relpath="_rel/$relname"}) when is_list(RN) ->
